@@ -1,0 +1,298 @@
+create_jobs_table: |
+  CREATE TABLE IF NOT EXISTS jobs (
+    job_id SERIAL PRIMARY KEY,
+    company TEXT NOT NULL DEFAULT '__ALL_COMPANIES__',
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    CHECK (status IN ('pending', 'completed', 'failed', 'running')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT
+  );
+
+create_jobs_index: |
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique
+  ON jobs (company, start_date, end_date);
+
+insert_job: |
+  INSERT INTO jobs (
+    company,
+    start_date,
+    end_date
+  )
+  VALUES (
+    %(company)s,
+    %(start_date)s,
+    %(end_date)s
+  )
+  ON CONFLICT (company, start_date, end_date)
+  DO UPDATE
+  SET
+    status = 'pending',
+    completed_at = NULL,
+    error_message = NULL
+  WHERE jobs.status = 'failed'
+  RETURNING job_id;
+
+mark_job_running: |
+  UPDATE {table}
+  SET
+    status = 'running',
+    error_message = NULL
+  WHERE job_id = %(job_id)s;
+
+mark_job_completed: |
+  UPDATE {table}
+  SET
+    status = 'completed',
+    completed_at = CURRENT_TIMESTAMP,
+    error_message = NULL
+  WHERE job_id = %(job_id)s;
+
+mark_job_failed: |
+  UPDATE {table}
+  SET
+    status = 'failed',
+    completed_at = CURRENT_TIMESTAMP,
+    error_message = %(error_message)s
+  WHERE job_id = %(job_id)s;
+
+mark_job_pending: |
+  UPDATE jobs
+  SET
+    status = 'pending',
+    completed_at = NULL,
+    error_message = NULL
+  WHERE job_id = %(job_id)s;
+
+create_complaints_table: |
+  CREATE TABLE IF NOT EXISTS complaints (
+    complaint_id BIGINT PRIMARY KEY,
+    job_id INT NOT NULL
+      REFERENCES jobs(job_id)
+      ON DELETE CASCADE,
+    company TEXT NOT NULL,
+    issue TEXT NOT NULL,
+    product TEXT NOT NULL,
+    state TEXT,
+    date_received DATE NOT NULL,
+    collected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+insert_complaint: |
+  INSERT INTO complaints (
+    complaint_id,
+    job_id,
+    company,
+    issue,
+    product,
+    state,
+    date_received
+  )
+  VALUES (
+    %(complaint_id)s,
+    %(job_id)s,
+    %(company)s,
+    %(issue)s,
+    %(product)s,
+    %(state)s,
+    %(date_received)s
+  )
+  ON CONFLICT (complaint_id)
+  DO NOTHING
+  RETURNING complaint_id;
+
+create_complaints_narrative_table: |
+  CREATE TABLE IF NOT EXISTS complaints_narratives (
+    complaint_id BIGINT PRIMARY KEY
+      REFERENCES complaints(complaint_id)
+      ON DELETE CASCADE,
+    narrative TEXT NOT NULL
+  );
+
+insert_narrative: |
+  INSERT INTO complaints_narratives (
+    complaint_id,
+    narrative
+  )
+  VALUES (
+    %(complaint_id)s,
+    %(narrative)s
+  )
+  ON CONFLICT (complaint_id)
+  DO NOTHING
+  RETURNING complaint_id;
+
+create_exploratory_jobs_table: |
+  CREATE TABLE IF NOT EXISTS exploratory_jobs (
+    job_id SERIAL PRIMARY KEY,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    CHECK (status IN ('pending', 'completed', 'failed', 'running')),
+    fallback_level TEXT NOT NULL,
+    CHECK (fallback_level IN ('days', 'weeks')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT
+  );
+
+insert_exploratory_job: |
+  INSERT INTO exploratory_jobs (
+    start_date,
+    end_date,
+    fallback_level
+  )
+  VALUES (
+    %(start_date)s,
+    %(end_date)s,
+    %(level)s
+  )
+  RETURNING job_id;
+
+create_companies_table: |
+  CREATE TABLE IF NOT EXISTS companies (
+    id SERIAL PRIMARY KEY,
+    job_id INT NOT NULL
+      REFERENCES exploratory_jobs(job_id)
+      ON DELETE CASCADE,
+    company TEXT NOT NULL,
+    UNIQUE(job_id, company)
+  );
+
+insert_company: |
+  INSERT INTO companies (
+    job_id,
+    company
+  )
+  VALUES (
+    %(job_id)s,
+    %(company)s
+  )
+  ON CONFLICT (job_id, company)
+  DO NOTHING;
+
+drop_vector_delete_cleanup_infra: |
+  DROP TRIGGER IF EXISTS trg_enqueue_vector_delete_for_deleted_job
+  ON jobs;
+
+  DROP FUNCTION IF EXISTS enqueue_vector_delete_for_deleted_job();
+
+  DROP TABLE IF EXISTS vector_delete_queue;
+
+select_all_from_column: |
+  SELECT DISTINCT {field}
+  FROM {table};
+
+extract_required_data_coverage_jobs: |
+  WITH requested AS (
+      SELECT
+          %(company)s::text AS company,
+          %(start_date)s::date AS requested_start,
+          %(end_date)s::date AS requested_end
+  ),
+
+  coverage AS (
+      SELECT
+          r.company,
+          r.requested_start,
+          r.requested_end,
+          GREATEST(j.start_date, r.requested_start) AS covered_start,
+          LEAST(j.end_date, r.requested_end) AS covered_end
+      FROM requested r
+      JOIN jobs j
+          ON j.company = r.company
+          AND j.start_date <= r.requested_end
+          AND j.end_date >= r.requested_start
+      WHERE j.status = 'completed'
+  ),
+
+  ordered_coverage AS (
+      SELECT
+          company,
+          requested_start,
+          requested_end,
+          covered_start,
+          covered_end,
+
+          MAX(covered_end) OVER (
+              PARTITION BY company
+              ORDER BY covered_start, covered_end
+              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+          ) AS previous_max_end
+      FROM coverage
+  ),
+
+  gaps AS (
+
+      SELECT
+          r.company,
+          r.requested_start AS missing_start_date,
+          r.requested_end AS missing_end_date
+      FROM requested r
+      WHERE NOT EXISTS (
+          SELECT 1
+          FROM coverage c
+          WHERE c.company = r.company
+      )
+
+      UNION ALL
+
+      SELECT
+          company,
+          requested_start AS missing_start_date,
+          (MIN(covered_start) - INTERVAL '1 day')::date AS missing_end_date
+      FROM coverage
+      GROUP BY company, requested_start
+      HAVING requested_start < MIN(covered_start)
+
+      UNION ALL
+
+      SELECT
+          company,
+          (previous_max_end + INTERVAL '1 day')::date AS missing_start_date,
+          (covered_start - INTERVAL '1 day')::date AS missing_end_date
+      FROM ordered_coverage
+      WHERE previous_max_end IS NOT NULL
+        AND covered_start > previous_max_end + INTERVAL '1 day'
+
+      UNION ALL
+
+      SELECT
+          company,
+          (MAX(covered_end) + INTERVAL '1 day')::date AS missing_start_date,
+          requested_end AS missing_end_date
+      FROM coverage
+      GROUP BY company, requested_end
+      HAVING requested_end > MAX(covered_end)
+  )
+
+  SELECT
+      company,
+      missing_start_date,
+      missing_end_date
+  FROM gaps
+  WHERE missing_start_date <= missing_end_date
+  ORDER BY company, missing_start_date;
+
+create_filter_table: |
+  CREATE TABLE IF NOT EXISTS {table} (
+      id SERIAL PRIMARY KEY,
+      {column} TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+insert_into_filter_tables: |
+  INSERT INTO {table} ({column})
+  VALUES (%(value)s)
+  ON CONFLICT ({column})
+  DO NOTHING
+  RETURNING id;
+
+
+
+select_complaints_by_job_id: |
+  SELECT complaint_id
+  FROM complaints
+  WHERE job_id = %(job_id)s;

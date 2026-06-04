@@ -1,0 +1,33 @@
+# Python
+venv/
+lg-env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Mac
+.DS_Store
+
+# VS Code
+.vscode/
+
+# LangGraph
+.langgraph_api/
+
+# Node
+node_modules/
+.next/
+.turbo/
+
+# Logs
+*.log
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
