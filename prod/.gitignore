@@ -31,3 +31,6 @@ node_modules/
 build/
 dist/
 *.egg-info/
+
+# Vector databases
+prod/src/vector_dbs/
